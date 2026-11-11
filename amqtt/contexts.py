@@ -276,6 +276,11 @@ class BrokerConfig(Dictable):
     """Timeout for peer PUBCOMP after sending QoS 2 messages. Defaults to 5 seconds.
     `None` waits indefinitely for PUBCOMP.
     """
+    auth_timeout: int | float | None = 10
+    """Maximum seconds to wait for an authentication plugin to return a verdict on a CONNECT.
+    Plugins that exceed the limit are treated as failed and the connection is denied. `None`
+    waits indefinitely (not recommended: a hung plugin would hang the connection).
+    """
 
     def __post_init__(self) -> None:
         """Check config for errors and transform fields for easier use."""

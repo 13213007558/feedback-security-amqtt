@@ -91,6 +91,44 @@ plugins:
       extra:
         class_style: "simple"
 
+## Authentication
+
+### Combining plugin verdicts
+
+Each authentication plugin returns `True` (allow), `False` (deny) or `None` (abstain). The
+broker discards `None` verdicts, denies when no boolean verdict remains or any boolean verdict
+is `False`, and allows only when every boolean verdict is `True`. A plugin that raises or times
+out always denies the connection and produces an attributable `ERROR` log without the password.
+See [Authentication verdicts](../plugins/packaged_plugins.md#authentication-verdicts) for the
+full matrix.
+
+### `auth_timeout`
+
+`auth_timeout` *(float, seconds, default `10`)*: maximum time the broker waits for any single
+authentication plugin to return a verdict on a CONNECT. A plugin that exceeds the limit is
+cancelled, counted as a fault, and the connection is denied with CONNACK `0x05`. Set it to
+`null`/`None` to wait indefinitely (not recommended: a hung plugin would hang the connection).
+
+```yaml
+listeners:
+  default:
+    type: tcp
+    bind: 0.0.0.0:1883
+auth_timeout: 5
+plugins:
+  amqtt.plugins.authentication.AnonymousAuthPlugin:
+    allow_anonymous: false
+  amqtt.plugins.authentication.FileAuthPlugin:
+    password_file: /etc/amqtt/passwd
+```
+
+### Failing fast on configuration errors
+
+Plugin options are validated strictly against each plugin's `Config` dataclass while the broker
+starts. A misspelled option (for example `passwrd_file`) or a plugin dotted path that cannot be
+imported raises `PluginLoadError`/`PluginImportError` from `Broker(...)`, so deployment errors
+surface at startup rather than silently leaving a plugin inactive.
+
 ## Example
   
 When a configuration is passed to the `amqtt` script, here is the equivalent format based on the structures above:

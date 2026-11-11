@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from dataclasses import dataclass
@@ -38,6 +39,51 @@ class TestAuthPlugin(BaseAuthPlugin):
 
     async def authenticate(self, *, session: Session) -> bool | None:
         return True
+
+
+class TestNeutralAuthPlugin(BaseAuthPlugin):
+    """Auth plugin that abstains (returns None) for every connection."""
+
+    async def authenticate(self, *, session: Session) -> bool | None:
+        return None
+
+
+class TestDenyAuthPlugin(BaseAuthPlugin):
+    """Auth plugin that rejects (returns False) for every connection."""
+
+    async def authenticate(self, *, session: Session) -> bool | None:
+        return False
+
+
+class TestRaisingAuthPlugin(BaseAuthPlugin):
+    """Auth plugin that always fails at runtime with an exception."""
+
+    @dataclass
+    class Config:
+        error_message: str = "boom"
+
+    async def authenticate(self, *, session: Session) -> bool | None:
+        raise RuntimeError(self.config.error_message)
+
+
+class TestSlowAuthPlugin(BaseAuthPlugin):
+    """Auth plugin whose verdict never arrives within a normal auth timeout."""
+
+    @dataclass
+    class Config:
+        delay: float = 30.0
+
+    async def authenticate(self, *, session: Session) -> bool | None:
+        await asyncio.sleep(self.config.delay)
+        return True
+
+
+class TestMisconfiguredAuthPlugin(BaseAuthPlugin):
+    """Auth plugin with a strict Config, used to prove unknown keys fail at startup."""
+
+    @dataclass
+    class Config:
+        known_option: str = "default"
 
 
 class TestNoAuthPlugin(BaseAuthPlugin):

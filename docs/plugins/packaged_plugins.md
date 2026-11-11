@@ -39,6 +39,35 @@ By default, the `PacketLoggerPlugin` is  activated and configured for the client
 
 ## Plugins
 
+### Authentication verdicts
+
+Every authentication plugin's `authenticate()` coroutine returns one of:
+
+- `True`: the plugin allows the connection
+- `False`: the plugin denies the connection
+- `None`: the plugin cannot decide (for example `FileAuthPlugin` when no username is
+  provided); its verdict is ignored
+
+When several auth plugins are configured, the broker combines their verdicts on each CONNECT:
+
+1. a plugin that raises an exception or does not return before `auth_timeout` elapses is a
+   **fault**; the connection is always denied and an `ERROR` line names the offending plugin,
+   the client id and the username. Passwords are never logged.
+2. otherwise, `None` verdicts are discarded.
+3. if no boolean verdict remains, the connection is denied.
+4. the remaining boolean verdicts are combined with a logical AND: a single `False` denies the
+   connection even when other plugins return `True`; the connection is accepted only when every
+   boolean verdict is `True`.
+
+A denied CONNECT receives CONNACK return code `0x05` (not authorized) and the socket is closed.
+
+| Plugin verdicts            | Decision | Reason                                   |
+| -------------------------- | -------- | ---------------------------------------- |
+| `None`, `None`             | deny     | no boolean verdict                       |
+| `True`, `True`             | allow    | all boolean verdicts allow               |
+| `True`, `False`, `None`    | deny     | one denier overrules the allowers        |
+| `True`, exception/timeout  | deny     | plugin fault, logged with attribution    |
+
 ### Anonymous (Auth Plugin)
 
 `amqtt.plugins.authentication.AnonymousAuthPlugin`

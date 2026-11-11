@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- fix: authentication plugin failures (exceptions and timeouts) now deny the CONNECT with CONNACK `0x05` and an attributable, password-free `ERROR` log, instead of dropping the connection or letting another plugin's allowance through
+- new: broker `auth_timeout` option (default 10 seconds) bounds how long any single auth plugin may take before it is cancelled and treated as a fault
+- new: regression coverage for the multi-plugin verdict matrix (all-`None`, a denier mixed with allowers), startup failure on misspelled plugin options/paths, and runtime plugin exception/timeout handling
+
 ## 0.12.1
 
 This is a security and maintenance release addressing a vulnerability in the handling of QoS2 messages.

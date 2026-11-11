@@ -931,30 +931,65 @@ class Broker:
     async def _authenticate(self, session: Session, _: ListenerConfig) -> bool:
         """Call the authenticate method on registered plugins to test user authentication.
 
-        User is considered authenticated if all plugins called returns True.
         Plugins authenticate() method are supposed to return :
          - True if user is authentication succeed
          - False if user authentication fails
          - None if authentication can't be achieved (then plugin result is then ignored)
+
+        Plugin faults (raised exceptions or timeouts) always deny the connection, regardless of
+        the other plugins' verdicts; the offending plugin is logged without the session password.
+
+        The final verdict combines every *boolean* result as a logical AND:
+         - a plugin fault: connection denied
+         - no plugin returns a boolean: connection denied
+         - at least one plugin returns False: connection denied
+         - every boolean result is True: connection allowed
         :param session:
         :return:
         """
-        returns = await self.plugins_manager.map_plugin_auth(session=session)
+        auth_timeout = self.config.get("auth_timeout", None)
+        returns = await self.plugins_manager.map_plugin_auth(session=session, timeout=auth_timeout)
 
-        results = [result for result in returns.values() if result is not None] if returns else []
-        if len(results) < 1:
+        boolean_results: list[bool] = []
+        plugin_faulted = False
+        for plugin, result in returns.items():
+            plugin_name = plugin.__class__.__name__
+            if isinstance(result, BaseException):
+                plugin_faulted = True
+                if isinstance(result, asyncio.TimeoutError):
+                    self.logger.error(
+                        f"Authentication plugin '{plugin_name}' timed out after {auth_timeout}s; "
+                        f"denying connection for client '{session.client_id}' (user '{session.username}')",
+                    )
+                else:
+                    self.logger.error(
+                        f"Authentication plugin '{plugin_name}' raised "
+                        f"{result.__class__.__name__}: {result}; "
+                        f"denying connection for client '{session.client_id}' (user '{session.username}')",
+                        exc_info=result,
+                    )
+                continue
+
             if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug("Authentication failed: no plugin responded with a boolean")
+                self.logger.debug(f"Authentication '{plugin_name}' result: {result}")
+            if result is not None:
+                boolean_results.append(result)
+
+        if plugin_faulted:
             return False
 
-        if all(results):
+        if len(boolean_results) < 1:
             if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug("Authentication succeeded")
-            return True
+                self.logger.debug(
+                    f"Authentication failed: no plugin responded with a boolean "
+                    f"for client '{session.client_id}' (user '{session.username}')",
+                )
+            return False
 
-        for plugin, result in returns.items():
+        if all(boolean_results):
             if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(f"Authentication '{plugin.__class__.__name__}' result: {result}")
+                self.logger.debug(f"Authentication succeeded for client '{session.client_id}'")
+            return True
 
         return False
 

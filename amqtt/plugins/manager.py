@@ -362,42 +362,72 @@ class PluginManager(Generic[C]):
         plugins: list["BasePlugin[C]"],
         method_name: str,
         method_kwargs: dict[str, Any],
-    ) -> dict["BasePlugin[C]", str | bool | None]:
+        *,
+        timeout: float | None = None,
+        return_exceptions: bool = False,
+    ) -> dict["BasePlugin[C]", str | bool | None | BaseException]:
         """Call plugin coroutines.
 
         :param plugins: List of plugins to execute the method on
         :param method_name: Name of the method to call on each plugin
         :param method_kwargs: Keyword arguments to pass to the method
+        :param timeout: Maximum seconds to wait for each plugin coroutine. Plugins that do not
+            finish in time are cancelled and reported as `asyncio.TimeoutError`. `None` waits
+            indefinitely.
+        :param return_exceptions: When `True`, exceptions raised by a plugin (including a timeout)
+            are returned as the plugin's result instead of propagating to the caller.
         :return: dict containing return from coro call for each plugin.
         """
         tasks: list[asyncio.Future[Any]] = []
+        active_plugins: list[BasePlugin[C]] = []
 
         for plugin in plugins:
             if not hasattr(plugin, method_name):
                 continue
+            active_plugins.append(plugin)
 
             async def call_method(p: "BasePlugin[C]", kwargs: dict[str, Any]) -> Any:
                 method = getattr(p, method_name)
-                return await method(**kwargs)
+                coro: Awaitable[Any] = method(**kwargs)
+                if timeout is None:
+                    return await coro
+                try:
+                    return await asyncio.wait_for(coro, timeout=timeout)
+                except asyncio.TimeoutError:
+                    return asyncio.TimeoutError(f"Plugin '{p.__class__.__name__}' timed out after {timeout}s")
 
-            coro_instance: Awaitable[Any] = call_method(plugin, method_kwargs)
-            tasks.append(asyncio.ensure_future(coro_instance))
+            tasks.append(asyncio.ensure_future(call_method(plugin, method_kwargs)))
 
-        ret_dict: dict[BasePlugin[C], str | bool | None] = {}
+        ret_dict: dict[BasePlugin[C], str | bool | None | BaseException] = {}
         if tasks:
-            ret_list = await asyncio.gather(*tasks)
-            ret_dict = dict(zip(plugins, ret_list, strict=False))
+            ret_list = await asyncio.gather(*tasks, return_exceptions=return_exceptions)
+            ret_dict = dict(zip(active_plugins, ret_list, strict=False))
 
         return ret_dict
 
-    async def map_plugin_auth(self, *, session: Session) -> dict["BasePlugin[C]", str | bool | None]:
+    async def map_plugin_auth(
+        self,
+        *,
+        session: Session,
+        timeout: float | None = None,
+    ) -> dict["BasePlugin[C]", str | bool | None | BaseException]:
         """Schedule a coroutine for plugin 'authenticate' calls.
 
+        Plugin faults are isolated: exceptions and timeouts are returned in the result dict
+        instead of propagating, so the broker can deny the connection with an attributable log.
+
         :param session: the client session associated with the authentication check
+        :param timeout: Maximum seconds to wait for each plugin's `authenticate` coroutine.
+            `None` waits indefinitely.
         :return: dict containing return from coro call for each plugin.
         """
         return await self._map_plugin_method(
-            self._auth_plugins, "authenticate", {"session": session})  # type: ignore[arg-type]
+            self._auth_plugins,
+            "authenticate",
+            {"session": session},  # type: ignore[arg-type]
+            timeout=timeout,
+            return_exceptions=True,
+        )
 
     async def map_plugin_topic(
         self, *, session: Session, topic: str, action: "Action"
