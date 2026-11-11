@@ -157,7 +157,7 @@ If set to `None`, no restrictions are placed on client subscriptions (legacy beh
 
 - `publish-acl` *(mapping)*: determines publish access.
 
-- `receive-acl` *(mapping)*: determines if a message can be sent to a client.
+- `receive-acl` *(mapping)*: determines if a message can be sent to a client. The check is applied to every delivery path: real-time broadcasts, retained messages replayed on a new subscription, and messages queued for a disconnected persistent session, so revoking receive access also blocks replay of messages retained before the change.
 
     !!! info "Reserved usernames"
 

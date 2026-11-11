@@ -1039,6 +1039,15 @@ class Broker:
         results = await self.plugins_manager.map_plugin_topic(session=session, topic=topic, action=action)
         return all(result for result in results.values())
 
+    async def _is_message_receivable(self, session: Session, topic: str) -> bool:
+        """Authorize delivery of a message to a session using the RECEIVE action.
+
+        Real-time broadcasts, retained-message replays and disconnected-session
+        backlog must all pass the same check so that a message retained before a
+        permission change can never be delivered after the permission is revoked.
+        """
+        return await self._topic_filtering(session, topic=topic, action=Action.RECEIVE)
+
     async def _delete_session(self, client_id: str) -> None:
         """Delete an existing session data, for example due to clean session set in CONNECT."""
         session = self._sessions.pop(client_id, (None, None))[0]
@@ -1161,7 +1170,7 @@ class Broker:
             for target_session, sub_qos in subscriptions:
                 qos = broadcast.get("qos", sub_qos)
 
-                sendable = await self._topic_filtering(target_session, topic=broadcast["topic"], action=Action.RECEIVE)
+                sendable = await self._is_message_receivable(target_session, broadcast["topic"])
                 if not sendable:
                     self.logger.info(
                         f"{target_session.client_id} not allowed to receive messages from TOPIC {broadcast['topic']}.")
@@ -1265,6 +1274,12 @@ class Broker:
         if handler:
             while not session.retained_messages.empty():
                 retained = await session.retained_messages.get()
+                if not await self._is_message_receivable(session, retained.topic):
+                    self.logger.info(
+                        f"{session.client_id} not allowed to receive messages from TOPIC {retained.topic};"
+                        " dropping message retained while disconnected.",
+                    )
+                    continue
                 publish_tasks.append(
                     asyncio.ensure_future(
                         handler.mqtt_publish(retained.topic, retained.data, retained.qos, retain=True),
@@ -1286,6 +1301,12 @@ class Broker:
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug(f"matching : {topic} {topic_filter}")
             if self._matches(topic, topic_filter):
+                if not await self._is_message_receivable(session, topic):
+                    self.logger.info(
+                        f"{session.client_id} not allowed to receive messages from TOPIC {topic};"
+                        " skipping retained message replay.",
+                    )
+                    continue
                 if self.logger.isEnabledFor(logging.DEBUG):
                     self.logger.debug(f"{topic} and {topic_filter} match")
                 handler = self._get_handler(session)
