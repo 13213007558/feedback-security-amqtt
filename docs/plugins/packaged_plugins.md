@@ -155,6 +155,13 @@ If set to `None`, no restrictions are placed on client subscriptions (legacy beh
 
 - `acl` *(mapping)*: Deprecated and replaced by `subscribe-acl` (v0.11.2).
 
+- `strict-subscribe-acl` *(mapping)*: determines subscription access using the
+  strict containment rule described below.
+
+- `strict-subscribe` *(bool)*: when `true`, apply the strict containment rule
+  to the `subscribe-acl` (or deprecated `acl`) mapping instead of introducing a
+  separate `strict-subscribe-acl` mapping. Defaults to `false`.
+
 - `publish-acl` *(mapping)*: determines publish access.
 
 - `receive-acl` *(mapping)*: determines if a message can be sent to a client.
@@ -163,6 +170,64 @@ If set to `None`, no restrictions are placed on client subscriptions (legacy beh
 
         - The username `admin` is allowed access to all topics.
         - The username `anonymous` will control allowed topics, if using the `auth_anonymous` plugin.
+
+#### Strict subscription authorisation
+
+A SUBSCRIBE request may itself contain `+` or `#` wildcards. The legacy
+`subscribe-acl` / `acl` check compares the requested filter against each
+allowed filter directly; that is a filter-to-filter comparison and cannot prove
+that *every* concrete topic the request can match is authorised. A request such
+as `tenant/#` can therefore slip past a narrow rule like `tenant/+/public/#`.
+
+The strict mode flips the question around: a subscription is accepted **only if
+every concrete topic matched by the requested filter is covered by the union of
+the user's allowed filters**. This is decided by a finite-partition proof over
+the filter trie (the infinite alphabet of possible level values is split into
+the literal tokens used by the allowed rules plus one "other" bucket at every
+depth), not by sampling a few example topics.
+
+When a request is rejected, the plugin logs a concrete **witness** topic that
+the requested filter matches but none of the allowed rules accept, for example:
+
+```text
+Strict subscribe ACL denied filter 'tenant/#' for user 'user';
+witness topic 'tenant' is matched by the request but by no allowed rule
+```
+
+The witness can be used to reproduce and verify the decision through the
+broker's own subscription and message delivery path.
+
+`#` matches zero or more levels, so `a/#` also matches the topic `a`; and per
+MQTT 3.1.1 §4.7.2 a filter beginning with `+` or `#` never matches a topic that
+starts with `$`. Both rules are taken into account, meaning `$SYS/#` requires an
+explicit `$`-prefixed allowed rule even when `#` is listed.
+
+Recommended (strict) configuration:
+
+```yaml
+plugins:
+  amqtt.plugins.topic_checking.TopicAccessControlListPlugin:
+    strict_subscribe_acl:
+      user:
+        - "tenant/+/public/#"
+        - "tenant/#"
+```
+
+Equivalently, keep a `subscribe_acl` mapping and opt into strict checking with
+the flag:
+
+```yaml
+plugins:
+  amqtt.plugins.topic_checking.TopicAccessControlListPlugin:
+    strict_subscribe: true
+    subscribe_acl:
+      user:
+        - "tenant/+/public/#"
+```
+
+`strict-subscribe-acl` is mutually exclusive with both `subscribe-acl` and the
+deprecated `acl`; configuring more than one raises a plugin initialisation
+error.
 
 ```yaml
 plugins:

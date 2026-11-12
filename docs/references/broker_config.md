@@ -73,8 +73,12 @@ plugins:
       - `acl` *(list)*: plugin to determine subscription access; if `publish-acl` is not specified, determine both publish and subscription access.
          The list should be a key-value pair, where:
       `<username>:[<topic1>, <topic2>, ...]` *(string, list[string])*: username of the client followed by a list of allowed topics (wildcards are supported: `#`, `+`).
-    
+
           *used by the `amqtt.plugins.topic_acl.TopicAclPlugin`*
+
+      - `strict-subscribe-acl` *(list)*: strict subscription access. A request is accepted only when **every** concrete topic its filter can match is covered by the union of the allowed rules; rejections log a concrete witness topic. Preferred over the legacy filter-to-filter `acl` / `subscribe-acl` comparison. See [Strict subscription authorisation](../plugins/packaged_plugins.md#strict-subscription-authorisation).
+
+      - `strict-subscribe` *(bool)*: opt into the same strict containment check for an existing `subscribe-acl` / `acl` mapping without defining a separate `strict-subscribe-acl` mapping.
 
       - `publish-acl` *(list)*: plugin to determine publish access. This parameter defines the list of access control rules; each item is a key-value pair, where:
       `<username>:[<topic1>, <topic2>, ...]` *(string, list[string])*: username of the client followed by a list of allowed topics (wildcards are supported: `#`, `+`).
