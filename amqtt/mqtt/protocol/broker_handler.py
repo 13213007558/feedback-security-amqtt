@@ -53,22 +53,37 @@ class BrokerProtocolHandler(ProtocolHandler["BrokerContext"]):
         handler_config: ProtocolHandlerConfig | None = None
     ) -> None:
         super().__init__(plugins_manager, session, loop, handler_config)
-        self._disconnect_waiter: asyncio.Future[DisconnectPacket | None] | None = None
+        # Created up-front so the future the broker awaits in wait_disconnect() is the same
+        # object that handle_disconnect()/stop() resolve, even before start() runs.
+        self._disconnect_waiter: asyncio.Future[DisconnectPacket | None] = asyncio.Future()
         self._pending_subscriptions: Queue[Subscription] = Queue()
         self._pending_unsubscriptions: Queue[UnSubscription] = Queue()
+        # Session connection_epoch this handler is bound to; used to tell a superseded
+        # connection apart from the current owner of a shared (same client_id) session.
+        self.epoch: int | None = None
+        # Set once a proper DISCONNECT packet is received, so later teardown/connection-closed
+        # notifications cannot downgrade a graceful disconnect into an abnormal one (which fires the will).
+        self._graceful_disconnect: bool = False
+
+    def attach(self, session: Session, reader: ReaderAdapter, writer: WriterAdapter) -> None:
+        super().attach(session, reader, writer)
+        self.epoch = session.connection_epoch
+        self._graceful_disconnect = False
 
     async def start(self) -> None:
         await super().start()
-        # Ensure the disconnect waiter is reset
+        # A connection always needs a fresh, pending disconnect waiter.
         if self._disconnect_waiter is None or self._disconnect_waiter.done():
             self._disconnect_waiter = asyncio.Future()
+        self._graceful_disconnect = False
 
     async def stop(self) -> None:
-        """Stop the protocol handler and reset the disconnect waiter."""
+        """Stop the protocol handler and mark the disconnect waiter resolved."""
         await super().stop()
         if self._disconnect_waiter is not None and not self._disconnect_waiter.done():
             self._disconnect_waiter.set_result(None)
-        self._disconnect_waiter = None  # Reset the disconnect waiter
+        # Keep the (now resolved) waiter instead of nulling it: a broker coroutine that awaits
+        # wait_disconnect() slightly later must still observe this connection's real result.
         # Clear pending subscriptions and unsubscriptions
         while not self._pending_subscriptions.empty():
             self._pending_subscriptions.get_nowait()
@@ -92,13 +107,21 @@ class BrokerProtocolHandler(ProtocolHandler["BrokerContext"]):
     async def handle_disconnect(self, disconnect: DisconnectPacket | None) -> None:
         """Handle a disconnect packet and notify the disconnect waiter."""
         self.logger.debug("Client disconnecting")
+        if disconnect is not None:
+            self._graceful_disconnect = True
         if self._disconnect_waiter and not self._disconnect_waiter.done():
             self.logger.debug(f"Setting disconnect waiter result to {disconnect!r}")
             self._disconnect_waiter.set_result(disconnect)
-        self._disconnect_waiter = None  # Reset the disconnect waiter to avoid reuse
+        # Retain the resolved waiter so a late awaiter observes this result; start() allocates
+        # a fresh pending future when the handler serves a new connection.
 
     async def handle_connection_closed(self) -> None:
         """Handle connection closure and notify the disconnect waiter."""
+        # A graceful DISCONNECT already terminated the session; don't signal an abnormal
+        # close afterwards, otherwise the broker would wrongly publish the client's will.
+        if self._graceful_disconnect:
+            self.logger.debug("Connection closed after a graceful DISCONNECT; not signalling abnormal close")
+            return
         await self.handle_disconnect(None)
 
     async def handle_connect(self, connect: ConnectPacket) -> None:

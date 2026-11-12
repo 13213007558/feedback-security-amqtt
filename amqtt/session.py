@@ -181,6 +181,16 @@ class Session:
 
         self.inbound_sni: str | None = None
 
+        # Bumped every time a (new) connection takes ownership of this session.
+        # A handler whose epoch no longer matches must not publish the session's will:
+        # its connection was superseded, for example by a same client_id take-over.
+        self.connection_epoch: int = 0
+
+    def bump_connection_epoch(self) -> int:
+        """Advance the session's connection epoch and return the new value."""
+        self.connection_epoch += 1
+        return self.connection_epoch
+
     def _init_states(self) -> None:
         self.transitions = Machine(states=Session.states, initial="new")
         self.transitions.add_transition(

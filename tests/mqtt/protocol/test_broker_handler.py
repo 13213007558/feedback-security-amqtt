@@ -110,47 +110,77 @@ async def init_handler_raising_from_packet(
 
 
 @pytest.mark.asyncio
-async def test_wait_disconnect_returns_none_without_waiter() -> None:
-    assert await make_handler(make_session()).wait_disconnect() is None
+async def test_wait_disconnect_pending_until_resolved() -> None:
+    # A handler always owns a disconnect waiter; wait_disconnect() stays pending until the
+    # connection actually closes or a DISCONNECT packet resolves it.
+    handler = make_handler(make_session())
+    assert handler._disconnect_waiter is not None
+
+    pending = asyncio.ensure_future(handler.wait_disconnect())
+    await asyncio.sleep(0)
+    assert not pending.done()
+
+    packet = DisconnectPacket()
+    await handler.handle_disconnect(packet)
+    assert await asyncio.wait_for(pending, timeout=1) is packet
 
 
 @pytest.mark.asyncio
-async def test_handle_disconnect_resolves_waiter_and_resets_it() -> None:
+async def test_handle_disconnect_resolves_waiter_and_keeps_it() -> None:
     handler = make_handler(make_session())
-    waiter: asyncio.Future[DisconnectPacket | None] = asyncio.Future()
+    waiter = handler._disconnect_waiter
+    assert waiter is not None
     packet = DisconnectPacket()
-    handler._disconnect_waiter = waiter
 
     await handler.handle_disconnect(packet)
 
     assert waiter.result() is packet
-    assert handler._disconnect_waiter is None
+    # The resolved waiter is retained so a late awaiter still sees the graceful disconnect.
+    assert handler._disconnect_waiter is waiter
+    assert handler._disconnect_waiter.done()
+
+
+@pytest.mark.asyncio
+async def test_handle_connection_closed_after_graceful_disconnect_keeps_result() -> None:
+    handler = make_handler(make_session())
+    waiter = handler._disconnect_waiter
+    assert waiter is not None
+    packet = DisconnectPacket()
+
+    await handler.handle_disconnect(packet)
+    # The reader loop's trailing connection-closed notification must not downgrade the result.
+    await handler.handle_connection_closed()
+
+    assert waiter.result() is packet
+    assert handler._graceful_disconnect is True
 
 
 @pytest.mark.asyncio
 async def test_handle_connection_closed_resolves_waiter_with_none() -> None:
     handler = make_handler(make_session())
-    waiter: asyncio.Future[DisconnectPacket | None] = asyncio.Future()
-    handler._disconnect_waiter = waiter
+    waiter = handler._disconnect_waiter
+    assert waiter is not None
 
     await handler.handle_connection_closed()
 
     assert waiter.result() is None
-    assert handler._disconnect_waiter is None
+    assert handler._disconnect_waiter is waiter
+    assert handler._disconnect_waiter.done()
 
 
 @pytest.mark.asyncio
 async def test_stop_resolves_disconnect_waiter_and_clears_pending_queues() -> None:
     handler = make_handler(make_session())
-    waiter: asyncio.Future[DisconnectPacket | None] = asyncio.Future()
-    handler._disconnect_waiter = waiter
+    waiter = handler._disconnect_waiter
+    assert waiter is not None
     await handler._pending_subscriptions.put(Subscription(1, [("topic/a", 0)]))
     await handler._pending_unsubscriptions.put(UnSubscription(2, ["topic/b"]))
 
     await handler.stop()
 
     assert waiter.result() is None
-    assert handler._disconnect_waiter is None
+    assert handler._disconnect_waiter is waiter
+    assert handler._disconnect_waiter.done()
     assert handler._pending_subscriptions.empty()
     assert handler._pending_unsubscriptions.empty()
     assert handler.writer is not None

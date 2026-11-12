@@ -622,6 +622,7 @@ class Broker:
             existing_client_session.will_message = client_session.will_message
             existing_client_session.will_topic = client_session.will_topic
             existing_client_session.will_qos = client_session.will_qos
+            existing_client_session.will_retain = client_session.will_retain
             existing_client_session.keep_alive = client_session.keep_alive
             existing_client_session.username = client_session.username
             existing_client_session.password = client_session.password
@@ -637,6 +638,9 @@ class Broker:
             client_session.parent = 1
         else:
             client_session.parent = 0
+
+        # This connection now owns the session; any previously attached handler is stale.
+        client_session.bump_connection_epoch()
 
         timeout_disconnect_delay = self.config.get("timeout-disconnect-delay", 0)
         if client_session.keep_alive > 0 and isinstance(timeout_disconnect_delay, int):
@@ -689,10 +693,20 @@ class Broker:
         handler.attach(client_session, reader, writer)
         self._sessions[client_session.client_id] = (client_session, handler)
 
-        await handler.mqtt_connack_authorize(authenticated)
+        # A will is published through the broker on behalf of this client, so it must satisfy
+        # the same publish-acl constraints as a normal PUBLISH. Reject a will the client is not
+        # allowed to publish to before acknowledging the connection.
+        will_authorized = await self._authorize_will(client_session)
 
-        if not authenticated:
-            await writer.close()
+        await handler.mqtt_connack_authorize(authenticated and will_authorized)
+
+        if not authenticated or not will_authorized:
+            if not will_authorized and authenticated:
+                self.logger.warning(
+                    f"{client_session.client_id} not allowed to declare a will on TOPIC "
+                    f"{client_session.will_topic}; closing connection.",
+                )
+            await self._reject_client_session(client_session, handler)
             return
 
         await self.plugins_manager.fire_event(BrokerEvents.CLIENT_CONNECTED,
@@ -787,28 +801,24 @@ class Broker:
         result = disconnect_waiter.result()
         if self.logger.isEnabledFor(logging.DEBUG):
             self.logger.debug(f"{client_session.client_id} Result from wait_disconnect: {result}")
+
+        # A take-over has already given this session to a newer connection. This stale handler
+        # must not publish the will nor tear down the session/state now owned by the new owner.
+        if handler.epoch != client_session.connection_epoch:
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    f"{client_session.client_id} stale connection (epoch {handler.epoch}) skipped; "
+                    f"session is owned by epoch {client_session.connection_epoch}.",
+                )
+            await self._stop_handler(handler)
+            return
+
         # if the client disconnects abruptly by sending no message or the message isn't a disconnect packet
         if result is None or not isinstance(result, DisconnectPacket):
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug(f"Will flag: {client_session.will_flag}")
             if client_session.will_flag:
-                if self.logger.isEnabledFor(logging.DEBUG):
-                    self.logger.debug(
-                        f"Client {format_client_message(client_session)} disconnected abnormally, sending will message",
-                    )
-                await self._broadcast_message(
-                    client_session,
-                    client_session.will_topic,
-                    client_session.will_message,
-                    client_session.will_qos,
-                )
-                if client_session.will_retain:
-                    await self.retain_message(
-                        client_session,
-                        client_session.will_topic,
-                        client_session.will_message,
-                        client_session.will_qos,
-                    )
+                await self._publish_will_if_authorized(client_session, handler)
 
         # normal or not, let's end the client's session
         if self.logger.isEnabledFor(logging.DEBUG):
@@ -818,6 +828,80 @@ class Broker:
         await self.plugins_manager.fire_event(BrokerEvents.CLIENT_DISCONNECTED,
                                               client_id=client_session.client_id,
                                               client_session=client_session)
+
+    async def _reject_client_session(self, client_session: Session, handler: BrokerProtocolHandler) -> None:
+        """Tear down a connection whose CONNECT was refused (bad auth or unauthorized will).
+
+        The CONNACK has already been sent. Close the transport and make sure a clean
+        session does not linger as a disconnected, never-expiring zombie. Persistent
+        (clean_session=False) sessions are kept so subscriptions and queued messages survive.
+        """
+        await self._stop_handler(handler)
+        if client_session.transitions.is_connected():
+            client_session.transitions.disconnect()
+        if client_session.clean_session and client_session.client_id in self._sessions:
+            await self._delete_session(client_session.client_id)
+
+    async def _authorize_will(self, client_session: Session) -> bool:
+        """Check that the session's will topic may be published by the client.
+
+        A will is an internal PUBLISH performed on the client's behalf, so it is
+        evaluated against the same `Action.PUBLISH` topic filtering as a regular PUBLISH.
+        Sessions without a will are trivially authorized.
+        """
+        if not client_session.will_flag:
+            return True
+
+        will_topic = client_session.will_topic
+        if not will_topic:
+            return False
+
+        return await self._topic_filtering(client_session, topic=will_topic, action=Action.PUBLISH)
+
+    async def _publish_will_if_authorized(
+        self,
+        client_session: Session,
+        handler: BrokerProtocolHandler,
+    ) -> None:
+        """Publish a session's will, guarding against stale handlers and revoked permissions.
+
+        - Only the handler currently owning the session epoch may fire the will, so a connection
+          superseded by a same client_id take-over cannot publish the new session's will.
+        - The publish-acl is re-evaluated at trigger time, so a permission revoked after connect
+          prevents both the broadcast and any retained write.
+        """
+        if handler.epoch != client_session.connection_epoch:
+            self.logger.warning(
+                f"Suppressing will for {client_session.client_id}: connection epoch "
+                f"{handler.epoch} was superseded by {client_session.connection_epoch} (take-over).",
+            )
+            return
+
+        permitted = await self._authorize_will(client_session)
+        if not permitted:
+            self.logger.info(
+                f"{client_session.client_id} will on TOPIC {client_session.will_topic} "
+                "is no longer authorized; will message and retained store are skipped.",
+            )
+            return
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                f"Client {format_client_message(client_session)} disconnected abnormally, sending will message",
+            )
+        await self._broadcast_message(
+            client_session,
+            client_session.will_topic,
+            client_session.will_message,
+            client_session.will_qos,
+        )
+        if client_session.will_retain:
+            await self.retain_message(
+                client_session,
+                client_session.will_topic,
+                client_session.will_message,
+                client_session.will_qos,
+            )
 
     async def _handle_subscription(
         self,
