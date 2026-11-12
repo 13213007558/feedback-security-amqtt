@@ -195,7 +195,7 @@ async def test_persistent_session_reconnect_refreshes_tls_metadata(
     broker._sni_callback(new_ssl_object, "new.example", ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER))
     monkeypatch.setattr(BrokerProtocolHandler, "init_from_connect", staticmethod(fake_init_from_connect))
 
-    _, session = await broker._initialize_client_session(
+    _, incoming = await broker._initialize_client_session(
         BufferReader(b""),
         SNIWriter(new_ssl_object),
         "198.51.100.10",
@@ -203,7 +203,16 @@ async def test_persistent_session_reconnect_refreshes_tls_metadata(
         "mqtts",
     )
 
+    # Initialization only parses the CONNECT and must not touch the existing session.
+    assert incoming is incoming_session
+    assert existing_session.remote_address == "192.0.2.1"
+    assert existing_session.ssl_object is old_ssl_object
+    assert existing_session.inbound_sni == "old.example"
+
+    session, old_handler = await broker._adopt_client_session(incoming)
+
     assert session is existing_session
+    assert old_handler is broker._sessions["persisted-client"][1]
     assert session.remote_address == "198.51.100.10"
     assert session.remote_port == 1884
     assert session.ssl_object is new_ssl_object

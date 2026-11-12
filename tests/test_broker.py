@@ -361,7 +361,8 @@ async def test_client_connect_clean_session_false(broker):
 
 
 @pytest.mark.asyncio
-async def test_existing_session_reconnect_updates_ssl_object(broker, monkeypatch):
+async def test_existing_session_reconnect_updates_ssl_object(mock_plugin_manager, monkeypatch):
+    broker = Broker()
     client_id = "persisted-client"
     old_ssl_object = object()
     new_ssl_object = MagicMock(spec=ssl.SSLObject)
@@ -379,6 +380,12 @@ async def test_existing_session_reconnect_updates_ssl_object(broker, monkeypatch
 
     reconnect_handler = BrokerProtocolHandler(broker.plugins_manager, reconnect_session)
 
+    reconnect_session.username = "new-user"
+    reconnect_session.password = "new-password"
+    reconnect_session.will_flag = True
+    reconnect_session.will_topic = "/new-will"
+    reconnect_session.will_message = b"new-will-payload"
+
     async def init_from_connect(*_, handler_config: ProtocolHandlerConfig):
         assert handler_config is not None
         return reconnect_handler, reconnect_session
@@ -387,14 +394,27 @@ async def test_existing_session_reconnect_updates_ssl_object(broker, monkeypatch
     writer = MagicMock()
     writer.get_ssl_info.return_value = new_ssl_object
 
-    handler, session = await broker._initialize_client_session(MagicMock(), writer, "127.0.0.1", 1883, "default")
+    handler, incoming = await broker._initialize_client_session(MagicMock(), writer, "127.0.0.1", 1883, "default")
 
+    # Parsing the CONNECT must not reuse or mutate the persisted session yet.
     assert handler is reconnect_handler
+    assert incoming is reconnect_session
+    assert broker._sessions[client_id][0] is existing_session
+    assert existing_session.ssl_object is old_ssl_object
+    assert existing_session.username is None
+
+    session, old_handler = await broker._adopt_client_session(incoming)
+
+    assert old_handler is broker._sessions[client_id][1]
     assert session is existing_session
     assert session.parent == 1
     assert session.ssl_object is new_ssl_object
     assert session.ssl_object is not old_ssl_object
-    assert writer.get_ssl_info.call_count == 2
+    assert session.username == "new-user"
+    assert session.password == "new-password"
+    assert session.will_topic == "/new-will"
+    assert session.will_message == b"new-will-payload"
+    assert writer.get_ssl_info.call_count == 1
 
 
 @pytest.mark.asyncio

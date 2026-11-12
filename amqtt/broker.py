@@ -235,6 +235,9 @@ class Broker:
         self._servers: dict[str, Server] = {}
         self._init_states()
         self._sessions: dict[str, tuple[Session, BrokerProtocolHandler]] = {}
+        # Serializes session adoption/take-over so concurrent CONNECTs can't interleave
+        # authentication and replacement of an existing client's session state.
+        self._session_lock = asyncio.Lock()
         self._subscriptions: dict[str, list[tuple[Session, int]]] = {}
         self._retained_messages: dict[str, RetainedApplicationMessage] = {}
 
@@ -567,7 +570,12 @@ class Broker:
         remote_port: int,
         listener_name: str,
     ) -> tuple[BrokerProtocolHandler, Session]:
-        """Initialize a client session and protocol handler."""
+        """Read the CONNECT packet and build the incoming protocol handler and session.
+
+        This method performs no mutation of existing session state: authentication and
+        session adoption happen afterwards, so a rejected or failing CONNECT can never
+        disturb a working client sharing the same client identifier.
+        """
         handler_config = ProtocolHandlerConfig.init_from_config(self.config)
 
         # Wait for first packet and expect a CONNECT
@@ -603,25 +611,61 @@ class Broker:
         client_session.ssl_object = ssl_object
         client_session.inbound_sni = self._pop_inbound_sni(ssl_object)
 
-        if client_session.clean_session:
-            # Delete existing session and create a new one
-            if client_session.client_id is not None and client_session.client_id != "":
-                await self._delete_session(client_session.client_id)
-            else:
-                client_session.client_id = gen_client_id()
+        # Assign the generated client id up front so authentication sees the final id;
+        # no shared session state is touched at this point.
+        if client_session.clean_session and not client_session.client_id:
+            client_session.client_id = gen_client_id()
 
-            client_session.parent = 0
-        # Get session from cache
-        elif client_session.client_id and client_session.client_id in self._sessions:
+        timeout_disconnect_delay = self.config.get("timeout-disconnect-delay", 0)
+        if client_session.keep_alive > 0 and isinstance(timeout_disconnect_delay, int):
+            client_session.keep_alive += timeout_disconnect_delay
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(f"Keep-alive timeout={client_session.keep_alive}")
+        return handler, client_session
+
+    async def _adopt_client_session(
+        self,
+        client_session: Session,
+    ) -> tuple[Session, BrokerProtocolHandler | None]:
+        """Apply an authenticated CONNECT to the broker's session state.
+
+        Runs after successful authentication under :attr:`_session_lock`, guaranteeing
+        that the lookup and the replacement of an existing session happen atomically.
+
+        Returns the session that must be attached to the new handler and the previous
+        handler, if any, which the caller is responsible for stopping.
+        """
+        client_id = client_session.client_id
+        async with self._session_lock:
+            if client_session.clean_session:
+                # Delete existing session and create a new one
+                old_session, old_handler = self._sessions.pop(client_id, (None, None))
+                if old_session is not None:
+                    if self.logger.isEnabledFor(logging.DEBUG):
+                        self.logger.debug(f"Deleted existing session {old_session!r}")
+                    await self._del_all_subscriptions(old_session)
+                    old_session.clear_queues()
+
+                client_session.parent = 0
+                return client_session, old_handler
+
+            # Persistent session: reuse the cached session if one exists
+            existing = self._sessions.get(client_id)
+            if existing is None:
+                client_session.parent = 0
+                return client_session, None
+
             if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(f"Found old session {self._sessions[client_session.client_id]!r}")
+                self.logger.debug(f"Found old session {existing[0]!r}")
 
             # even though the session previously existed, the new connection can bring updated configuration and credentials
-            existing_client_session, _ = self._sessions[client_session.client_id]
+            existing_client_session, old_handler = existing
             existing_client_session.will_flag = client_session.will_flag
             existing_client_session.will_message = client_session.will_message
             existing_client_session.will_topic = client_session.will_topic
             existing_client_session.will_qos = client_session.will_qos
+            existing_client_session.will_retain = client_session.will_retain
             existing_client_session.keep_alive = client_session.keep_alive
             existing_client_session.username = client_session.username
             existing_client_session.password = client_session.password
@@ -631,20 +675,8 @@ class Broker:
             existing_client_session.ssl_object = client_session.ssl_object
             existing_client_session.inbound_sni = client_session.inbound_sni
 
-            existing_client_session.ssl_object = writer.get_ssl_info()
-
-            client_session = existing_client_session
-            client_session.parent = 1
-        else:
-            client_session.parent = 0
-
-        timeout_disconnect_delay = self.config.get("timeout-disconnect-delay", 0)
-        if client_session.keep_alive > 0 and isinstance(timeout_disconnect_delay, int):
-            client_session.keep_alive += timeout_disconnect_delay
-
-        if self.logger.isEnabledFor(logging.DEBUG):
-            self.logger.debug(f"Keep-alive timeout={client_session.keep_alive}")
-        return handler, client_session
+            existing_client_session.parent = 1
+            return existing_client_session, old_handler
 
     def create_offline_session(self, client_id: str) -> tuple[BrokerProtocolHandler, Session]:
         session = Session()
@@ -666,11 +698,30 @@ class Broker:
         listener_name: str,
     ) -> None:
         """Handle the lifecycle of a client session."""
-        authenticated = await self._authenticate(client_session, self.listeners_config[listener_name])
+        # Authentication happens before any existing session is deleted or mutated,
+        # so failed logins leave a working client with the same client id untouched.
+        try:
+            authenticated = await self._authenticate(client_session, self.listeners_config[listener_name])
+        except Exception:
+            self.logger.exception(
+                f"Authentication plugin raised while authenticating {client_session.client_id}; "
+                "rejecting the connection without modifying any existing session",
+            )
+            authenticated = False
 
         if client_session.client_id is None:
             msg = "Client ID was not correctly created/set."
             raise BrokerError(msg)
+
+        if not authenticated:
+            # Reject on the incoming connection only; shared session state is untouched.
+            handler.attach(client_session, reader, writer)
+            await handler.mqtt_connack_authorize(False)
+            await writer.close()
+            return
+
+        # Only an authenticated connection is allowed to adopt or replace an existing session.
+        client_session, old_handler = await self._adopt_client_session(client_session)
 
         while True:
             try:
@@ -679,21 +730,19 @@ class Broker:
             except (MachineError, ValueError):
                 if client_session.transitions.is_connected():
                     self.logger.warning(f"Client {client_session.client_id} is already connected, performing take-over.")
-                    old_session = self._sessions[client_session.client_id]
-                    await old_session[1].handle_connection_closed()
-                    await old_session[1].stop()
                     break
                 self.logger.warning(f"Client {client_session.client_id} is reconnecting too quickly, make it wait")
                 await asyncio.sleep(1)
+
+        if old_handler is not None:
+            # Stop the previous connection's handler, which also closes its writer.
+            await old_handler.handle_connection_closed()
+            await old_handler.stop()
 
         handler.attach(client_session, reader, writer)
         self._sessions[client_session.client_id] = (client_session, handler)
 
         await handler.mqtt_connack_authorize(authenticated)
-
-        if not authenticated:
-            await writer.close()
-            return
 
         await self.plugins_manager.fire_event(BrokerEvents.CLIENT_CONNECTED,
                                               client_id=client_session.client_id,
@@ -1038,23 +1087,6 @@ class Broker:
 
         results = await self.plugins_manager.map_plugin_topic(session=session, topic=topic, action=action)
         return all(result for result in results.values())
-
-    async def _delete_session(self, client_id: str) -> None:
-        """Delete an existing session data, for example due to clean session set in CONNECT."""
-        session = self._sessions.pop(client_id, (None, None))[0]
-
-        if session is None:
-            if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(f"Delete session : session {client_id} doesn't exist")
-            return
-        if self.logger.isEnabledFor(logging.DEBUG):
-            self.logger.debug(f"Deleted existing session {session!r}")
-
-        # Delete subscriptions
-        if self.logger.isEnabledFor(logging.DEBUG):
-            self.logger.debug(f"Deleting session {session!r} subscriptions")
-        await self._del_all_subscriptions(session)
-        session.clear_queues()
 
     async def _del_all_subscriptions(self, session: Session) -> None:
         """Delete all topic subscriptions for a given session."""
